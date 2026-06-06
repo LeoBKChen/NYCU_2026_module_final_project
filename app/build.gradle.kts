@@ -53,12 +53,8 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
-    // 使用 LiteRT-LM (新一代端側推理庫，支援 .litertlm 格式)
     implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")
-    // 基礎的 MediaPipe 核心庫（提供 MPImage 支援）
     implementation("com.google.mediapipe:tasks-vision:0.10.35")
-//    implementation("com.google.mediapipe:tasks-genai:0.10.35") // 支援多模態的 MediaPipe 版本
-//    implementation("com.google.mediapipe:tasks-vision:0.10.35")
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
