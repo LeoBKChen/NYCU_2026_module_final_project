@@ -20,6 +20,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,10 +31,13 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.aigi_dectector.ui.theme.Aigi_dectectorTheme
 import com.google.gson.Gson
+import java.io.File
+import java.util.Locale
 
 // 定義資料結構以解析模型輸出
 data class DetectionResult(
@@ -157,6 +162,9 @@ fun DetectorScreen(detector: MultimodalDetector, modifier: Modifier = Modifier) 
     ) {
         Text(text = "AI 偽造偵測系統", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
 
+        // --- 模型選取區塊 ---
+        ModelSelectionSection(detector)
+
         // 內容預覽卡片
         Card(
             modifier = Modifier.fillMaxWidth().height(220.dp),
@@ -271,7 +279,7 @@ fun DetectorScreen(detector: MultimodalDetector, modifier: Modifier = Modifier) 
         // ─── 完整保留並移至最底部的模型狀態與路徑檢查區塊 ───
         val actualModelPath = detector.modelPath
         val initError = detector.initializationError
-        val isInit = detector.initializationError == null && !detector.isInitializing
+        val isInit = detector.initializationError == null && !detector.isInitializing && detector.modelPath != null
 
         Column(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
             HorizontalDivider(modifier = Modifier.padding(bottom = 8.dp))
@@ -280,6 +288,7 @@ fun DetectorScreen(detector: MultimodalDetector, modifier: Modifier = Modifier) 
                     detector.isInitializing -> "⏳ 模型初始化中..."
                     initError != null -> "❌ 初始化失敗"
                     isInit -> "✅ 模型已就緒"
+                    detector.modelPath == null -> "⚠️ 尚未載入任何模型"
                     else -> "❓ 未知狀態"
                 },
                 style = MaterialTheme.typography.labelLarge,
@@ -287,6 +296,7 @@ fun DetectorScreen(detector: MultimodalDetector, modifier: Modifier = Modifier) 
                     detector.isInitializing -> MaterialTheme.colorScheme.secondary
                     initError != null -> MaterialTheme.colorScheme.error
                     isInit -> MaterialTheme.colorScheme.primary
+                    detector.modelPath == null -> MaterialTheme.colorScheme.tertiary
                     else -> MaterialTheme.colorScheme.outline
                 }
             )
@@ -312,6 +322,95 @@ fun DetectorScreen(detector: MultimodalDetector, modifier: Modifier = Modifier) 
     // 詳情對話框
     if (showDetails && parsedResult != null) {
         DetailDialog(parsedResult!!) { showDetails = false }
+    }
+}
+
+@Composable
+fun ModelSelectionSection(detector: MultimodalDetector) {
+    var expanded by remember { mutableStateOf(false) }
+    val currentModelPath = detector.modelPath
+    val availableModels = detector.availableModels
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    Icon(
+                        Icons.Default.Settings,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(text = "目前模型：", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = currentModelPath?.let { File(it).name } ?: "未選取",
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                IconButton(onClick = { detector.refreshAvailableModels() }) {
+                    Icon(Icons.Default.Refresh, contentDescription = "刷新清單")
+                }
+            }
+
+            Box(modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = { expanded = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !detector.isInitializing
+                ) {
+                    Text(if (detector.isInitializing) "更換模型中..." else "切換模型")
+                }
+
+                DropdownMenu(
+                    expanded = expanded,
+                    onDismissRequest = { expanded = false },
+                    modifier = Modifier.fillMaxWidth(0.9f)
+                ) {
+                    if (availableModels.isEmpty()) {
+                        DropdownMenuItem(
+                            text = { Text("目錄下無模型檔案") },
+                            onClick = { expanded = false },
+                            enabled = false
+                        )
+                    } else {
+                        availableModels.forEach { file ->
+                            DropdownMenuItem(
+                                text = {
+                                    Column {
+                                        Text(file.name, fontWeight = if (detector.modelPath == file.absolutePath) FontWeight.Bold else FontWeight.Normal)
+                                        Text(
+                                            "${String.format(Locale.getDefault(), "%.2f", file.length() / 1024.0 / 1024.0 / 1024.0)} GB",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = Color.Gray
+                                        )
+                                    }
+                                },
+                                onClick = {
+                                    detector.switchModel(file.absolutePath)
+                                    expanded = false
+                                },
+                                leadingIcon = {
+                                    RadioButton(
+                                        selected = detector.modelPath == file.absolutePath,
+                                        onClick = null // 由 MenuItem 處理
+                                    )
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

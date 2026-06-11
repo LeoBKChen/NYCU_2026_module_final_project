@@ -40,6 +40,12 @@ android {
     androidResources  {
         // 防止系統壓縮 bin 檔，使其能透過記憶體映射 (Memory-Map) 快速載入
         noCompress.add("bin")
+        noCompress.add("tflite")
+    }
+    packaging {
+        jniLibs {
+            pickFirsts.add("**/libLiteRt.so")
+        }
     }
 }
 
@@ -53,6 +59,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation("com.google.ai.edge.litert:litert:2.1.0")
     implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")
     implementation("com.google.mediapipe:tasks-vision:0.10.35")
     testImplementation(libs.junit)

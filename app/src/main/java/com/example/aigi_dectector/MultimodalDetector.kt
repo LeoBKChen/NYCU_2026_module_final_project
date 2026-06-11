@@ -30,19 +30,53 @@ class MultimodalDetector(private val context: Context) {
     private var activeConversation: com.google.ai.edge.litertlm.Conversation? = null
     private val scope = CoroutineScope(Dispatchers.IO + Job())
     
+    // 🌟 1. 初始化 CLIP 階段偵測器
+    private val clipRunner = ClipLiteRtRunner(context)
+    
     var initializationError by mutableStateOf<String?>(null)
         private set
     var isInitializing by mutableStateOf(false)
         private set
     var modelPath by mutableStateOf<String?>(null)
         private set
+    var availableModels by mutableStateOf<List<File>>(emptyList())
+        private set
 
     init {
-        initInferenceAsync()
+        refreshAvailableModels()
+        // 預設載入第一個找到的模型
+        availableModels.firstOrNull()?.let {
+            initInferenceAsync(it.absolutePath)
+        }
     }
 
-    private fun initInferenceAsync() {
+    /**
+     * 掃描模型目錄並更新可用模型列表
+     */
+    fun refreshAvailableModels() {
+        val modelsDir = File(context.getExternalFilesDir(null), "models")
+        if (!modelsDir.exists()) {
+            modelsDir.mkdirs()
+        }
+        availableModels = modelsDir.listFiles { _, name -> name.endsWith(".litertlm") }?.toList() ?: emptyList()
+    }
+
+    /**
+     * 切換模型
+     */
+    fun switchModel(newModelPath: String) {
+        if (this.modelPath == newModelPath && engine != null) return
+        
+        scope.launch {
+            close() // 先關閉舊引擎釋放記憶體
+            initInferenceAsync(newModelPath)
+        }
+    }
+
+    private fun initInferenceAsync(targetPath: String? = null) {
         isInitializing = true
+        initializationError = null
+        
         scope.launch {
             try {
                 // 🌟 1. 物理防禦：強制清空舊模型的 XNNPACK 暫存檔，防止新舊模型結構衝突引發 OOM
@@ -52,20 +86,15 @@ class MultimodalDetector(private val context: Context) {
                     litertCacheDir.deleteRecursively()
                 }
                 litertCacheDir.mkdirs()
-                // 🌟 2. 精準指向 App 的免權限外部私有目錄 (避開 Android 16 Scoped Storage 大鎖)
-                val modelFileLitertlm = File(context.getExternalFilesDir(null), "models/gemma_4_E2B_finetune_0606_fixed_1.litertlm")
-                val modelFileDownload = File("/storage/emulated/0/Download/gemma_4_E2B_finetune_0605_4.litertlm")
 
-                val modelFile = when {
-                    modelFileLitertlm.exists() -> modelFileLitertlm
-                    else -> null
-                }
+                // 如果沒傳入路徑，則從可用列表中取第一個
+                val modelFile = targetPath?.let { File(it) } ?: availableModels.firstOrNull()
 
                 this@MultimodalDetector.modelPath = modelFile?.absolutePath
 
-                if (modelFile == null) {
-                    val error = "模型檔案不存在。請透過 adb 將模型放入以下私有路徑：\n" +
-                            "${modelFileLitertlm.absolutePath}"
+                if (modelFile == null || !modelFile.exists()) {
+                    val error = "模型檔案不存在。請確保模型已放入私有目錄：\n" +
+                            File(context.getExternalFilesDir(null), "models").absolutePath
                     Log.e("MultimodalDetector", error)
                     initializationError = error
                     isInitializing = false
@@ -73,25 +102,24 @@ class MultimodalDetector(private val context: Context) {
                 }
 
                 val modelPath = modelFile.absolutePath
-                Log.d("MultimodalDetector", "🚀 正在從私有路徑載入 2.53GB 微調模型 (LiteRT-LM)...")
+                Log.d("MultimodalDetector", "🚀 正在載入模型: ${modelFile.name} (LiteRT-LM)...")
 
                 // 🌟 3. 硬核生存配置：精準配算 CPU 記憶體上限與 Token 預算
                 val config = EngineConfig(
                     modelPath = modelPath,
-                    backend = Backend.GPU(),       // 🌟 保持 CPU，完美繞過 GPU 著色器的 BHWC 維度轉置錯誤
-                    visionBackend = Backend.GPU(), // 視覺同步回歸 CPU 穩定架構
-                    maxNumTokens = 1024,            // 🌟 核心破關：由 2048 限制到 600，平抑載入與 Prefill 時的實體 RAM 峰值
-                    maxNumImages = 1,              // 鎖定單張影像
+                    backend = Backend.GPU(),
+                    visionBackend = Backend.GPU(),
+//                    maxNumTokens = 1024,
+//                    maxNumImages = 1,
                     cacheDir = litertCacheDir.absolutePath
-
                 )
 
                 // 建立並初始化引擎
                 engine = Engine(config)
                 engine?.initialize()
-                Log.d("MultimodalDetector", "🎉 LiteRT-LM Engine 初始化成功，準備接納動態 Shape 算子")
+                Log.d("MultimodalDetector", "🎉 LiteRT-LM Engine 初始化成功：${modelFile.name}")
             } catch (e: Exception) {
-                val errorMsg = "初始化失敗: ${e.message}\n(提示: 請確保 Manifest 已開啟 android:largeHeap=\"true\")"
+                val errorMsg = "初始化失敗: ${e.message}\n(提示: 請確保模型為 .litertlm 格式)"
                 Log.e("MultimodalDetector", errorMsg, e)
                 initializationError = errorMsg
             } finally {
@@ -116,32 +144,55 @@ class MultimodalDetector(private val context: Context) {
         }
 
         try {
-            // 1. 清除先前的對話 Session
+            // ==========================================
+            // 🌟 [第一階段] 執行 CLIP-LoRA 快速二分類偵測
+            // ==========================================
+            val clipInputSize = 384
+            val clipBitmap = resizeBitmapToSquare(inputBitmap, width = clipInputSize)
+            val clipInputData = bitmapToInt8ByteArray(clipBitmap, clipInputSize)
+
+            Log.d("CLIP_DEBUG", "🚀 啟動 CLIP 偵測...")
+            val clipOutput: Boolean = clipRunner.isFake(clipInputData) // 拿回 true/false
+            Log.d("CLIP_DEBUG", "📊 CLIP 偵測結果 (isFake): $clipOutput")
+
+            // ==========================================
+            // 🌟 [第二階段] 動態生成 Prompt 並交由 Gemma 4 生成詳細描述
+            // ==========================================
+
+            // 1. 清除先前的對話 Session（必須在協程內安全操作）
             activeConversation?.close()
             activeConversation = null
 
+            // 2. 影像預處理：等比例縮放（建議 448，有效降低 S23 GPU 記憶體與時間維度壓力）
             val resizedBitmap = resizeBitmap(inputBitmap, maxSide = 448)
-
-
             val imageBytes = bitmapToByteArray(resizedBitmap)
 
-            val prompt = """
-                分析此圖片是否由 AI 生成 (Deepfake/AIGC)。
-                請針對以下八個面向進行評估並提供解釋：
-                1. Lighting & Shadows Consistency (光影一致性)
-                2. Edges & Boundaries (邊緣與邊界)
-                3. Texture & Resolution (紋理與解析度)
-                4. Perspective & Spatial Relationships (透視與空間關係)
-                5. Physical & Common Sense Logic (物理與常識邏輯)
-                6. Text & Symbols (文字與符號)
-                7. Human & Biological Structure Integrity (人體與生物結構完整性)
-                8. Material & Object Details (材質與物體細節)
+            // 3. 核心動態 Prompt 設計：將 CLIP 結果轉為文字提示注入
+            val clipHint = if (clipOutput) {
+                "【前級專家模型提示】：經第一階段 CLIP 輕量特徵網絡快速掃描，該圖片已被高度懷疑為『AI 生成偽造影像 (Fake)』。"
+            } else {
+                "【前級專家模型提示】：經第一階段 CLIP 輕量特徵網絡快速掃描，該圖片初步判定傾向為『相機實地拍攝之真實照片 (Real)』。"
+            }
 
+            val prompt = """
+                $clipHint
+                
+                請以此提示作為參考基底，對傳入的圖片進行分析此圖片是否由 AI 生成 (Deepfake/AIGC)。
+                請針對以下八個面向進行評估、尋找是否有對應的瑕疵證據並提供解釋：
+                1. Lighting & Shadows Consistency
+                2. Edges & Boundaries
+                3. Texture & Resolution
+                4. Perspective & Spatial Relationships
+                5. Physical & Common Sense Logic
+                6. Text & Symbols
+                7. Human & Biological Structure Integrity
+                8. Material & Object Details
+    
                 最終必須以 JSON 格式輸出結果：
                 {
                   "is_ai_generated": true/false,
                   "confidence": 0.0-1.0,
-                  "reason": "總結描述",
+                  "reason": "結合第一階段提示與八大面向的總結描述",
                   "detailed_analysis": {
                     "lighting": "解釋",
                     "edges": "解釋",
@@ -155,42 +206,14 @@ class MultimodalDetector(private val context: Context) {
                 }
             """.trimIndent()
 
-//            val prompt = """
-//                此圖片是由 AI 生成 (Deepfake/AIGC)。
-//                請針對以下八個面向提供解釋：
-//                1. Lighting & Shadows Consistency
-//                2. Edges & Boundaries
-//                3. Texture & Resolution
-//                4. Perspective & Spatial Relationships
-//                5. Physical & Common Sense Logic
-//                6. Text & Symbols
-//                7. Human & Biological Structure Integrity
-//                8. Material & Object Details
-//
-//                最終必須以 JSON 格式輸出結果：
-//                {
-//                  "is_ai_generated": false,
-//                  "confidence": 0.0-1.0,
-//                  "reason": "總結描述",
-//                  "detailed_analysis": {
-//                    "lighting": "解釋",
-//                    "edges": "解釋",
-//                    "texture": "解釋",
-//                    "perspective": "解釋",
-//                    "logic": "解釋",
-//                    "text": "解釋",
-//                    "biological": "解釋",
-//                    "details": "解釋"
-//                  }
-//                }
-//            """.trimIndent()
+            Log.d("GEMMA_DEBUG", "📝 動態 Prompt 注入成功，正在發送給 Gemma 4...")
 
             val conversation = currentEngine.createConversation()
             activeConversation = conversation
 
             val contents = Contents.of(
                 Content.Text(prompt),
-//                Content.ImageBytes(imageBytes)
+                Content.ImageBytes(imageBytes)
             )
             val message = Message.user(contents)
 
@@ -353,6 +376,26 @@ class MultimodalDetector(private val context: Context) {
     }
 
     /**
+     * 將 Bitmap 轉換為 CLIP 模型需要的 INT8 ByteArray
+     */
+    private fun bitmapToInt8ByteArray(bitmap: Bitmap, size: Int): ByteArray {
+        val resized = Bitmap.createScaledBitmap(bitmap, size, size, true)
+        val pixels = IntArray(size * size)
+        resized.getPixels(pixels, 0, size, 0, 0, size, size)
+        
+        val byteArray = ByteArray(size * size * 3)
+        for (i in pixels.indices) {
+            val p = pixels[i]
+            // 簡單處理：將 0-255 對映到 -128 到 127
+            // 注意：實際量化公式可能為 (pixel / 255.0 - mean) / std / scale + zero_point
+            byteArray[i * 3] = ((p shr 16 and 0xFF) - 128).toByte()
+            byteArray[i * 3 + 1] = ((p shr 8 and 0xFF) - 128).toByte()
+            byteArray[i * 3 + 2] = ((p and 0xFF) - 128).toByte()
+        }
+        return byteArray
+    }
+
+    /**
      * 將 Bitmap 等比例縮放，使長邊不超過指定像素
      */
     private fun resizeBitmap(source: Bitmap, maxSide: Int = 448): Bitmap {
@@ -373,8 +416,16 @@ class MultimodalDetector(private val context: Context) {
         return Bitmap.createScaledBitmap(source, newWidth, newHeight, true)
     }
 
+    private fun resizeBitmapToSquare(source: Bitmap, width: Int = 448): Bitmap {
+
+        return Bitmap.createScaledBitmap(source, width, width, true)
+    }
+
     fun close() {
+        activeConversation?.close()
+        activeConversation = null
         engine?.close()
         engine = null
+        clipRunner.close()
     }
 }
